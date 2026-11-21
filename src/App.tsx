@@ -1,327 +1,1007 @@
-import { useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  ArrowLeft,
-  ArrowRight,
-  Check,
-  Copy,
-  Download,
-  Menu,
-  X,
+  Briefcase,
+  FileCode2,
+  MessageSquare,
+  Phone,
+  PhoneOutgoing,
+  Settings,
+  ShieldCheck,
 } from 'lucide-react';
-import { TDD_SECTIONS, type SectionId } from './data/tddContent';
-import { ActiveTddSection } from './components/TddSections';
-import { generateFullTddMarkdown } from './utils/markdownExport';
+import type {
+  AppSettings,
+  AppWorkspaceTab,
+  BusinessProduct,
+  CallRecord,
+  ChatMessage,
+  Conversation,
+  ConversationKind,
+  PairedDevice,
+  ServerSnapshotPayload,
+} from './types/handrawina';
+import {
+  deriveConversationKey,
+  encryptE2eePayload,
+  generateEcdhKeyBundle,
+} from './crypto/e2eeEngine';
+import { upsertMessageIdempotent } from './utils/handrawinaState';
+import { ChatWorkspace } from './components/app/ChatWorkspace';
+import { CallsWorkspace, type ActiveCallSession } from './components/app/CallsWorkspace';
+import { SecurityDevicesWorkspace } from './components/app/SecurityDevicesWorkspace';
+import { BusinessWorkspace } from './components/app/BusinessWorkspace';
+import { TddEmbeddedWorkspace } from './components/app/TddEmbeddedWorkspace';
+import { JoinBarcodeModal, type JoinBarcodeMode } from './components/app/JoinBarcodeModal';
+import {
+  OutgoingCallModal,
+  type OutgoingCallLaunchParams,
+} from './components/app/OutgoingCallModal';
+import { SettingsWorkspace } from './components/app/SettingsWorkspace';
+import { parseHandrawinaJoinInput } from './utils/barcodeGenerator';
 
-const TOP_NAV_ITEMS: { id: SectionId; label: string }[] = [
-  { id: 'overview', label: 'Ringkasan' },
-  { id: 'e2ee', label: 'Enkripsi E2EE' },
-  { id: 'group-multidevice', label: 'Grup & Multi-Device' },
-  { id: 'realtime-webrtc', label: 'Real-Time & WebRTC' },
-  { id: 'account-business', label: 'Akun & Bisnis' },
-  { id: 'database', label: 'Skema Database' },
+const WORKSPACE_TABS: {
+  id: AppWorkspaceTab;
+  label: string;
+  mobileLabel: string;
+  icon: typeof MessageSquare;
+}[] = [
+  { id: 'chats', label: 'Obrolan', mobileLabel: 'Obrolan', icon: MessageSquare },
+  { id: 'calls', label: 'Panggilan', mobileLabel: 'Panggilan', icon: Phone },
+  { id: 'security', label: 'Keamanan', mobileLabel: 'Keamanan', icon: ShieldCheck },
+  { id: 'business', label: 'Bisnis', mobileLabel: 'Bisnis', icon: Briefcase },
+  { id: 'tdd', label: 'Arsitektur TDD', mobileLabel: 'TDD', icon: FileCode2 },
 ];
 
 export default function App() {
-  const [activeSection, setActiveSection] = useState<SectionId>('overview');
-  const [mobileMenuOpen, setMobileMenuOpen] = useState<boolean>(false);
-  const [copiedMarkdown, setCopiedMarkdown] = useState<boolean>(false);
-  const [downloadedNotice, setDownloadedNotice] = useState<boolean>(false);
+  const [activeTab, setActiveTab] = useState<AppWorkspaceTab>('chats');
+  const [snapshot, setSnapshot] = useState<ServerSnapshotPayload | null>(null);
+  const [activeConvId, setActiveConvId] = useState<string>('conv-raka');
+  const [wsConnected, setWsConnected] = useState<boolean>(false);
+  const [localFingerprint, setLocalFingerprint] = useState<string>('7c4f1920e88b41a290cd12aa33bb4499');
+  const [typingByConv, setTypingByConv] = useState<Record<string, string | null>>({});
+  const [activeCall, setActiveCall] = useState<ActiveCallSession | null>(null);
+  const [joinModalOpen, setJoinModalOpen] = useState<boolean>(false);
+  const [joinModalMode, setJoinModalMode] = useState<JoinBarcodeMode>('invite');
+  const [outgoingCallModalOpen, setOutgoingCallModalOpen] = useState<boolean>(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
-  const currentIndex = useMemo(
-    () => TDD_SECTIONS.findIndex((s) => s.id === activeSection),
-    [activeSection]
+  const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimerRef = useRef<number | null>(null);
+
+  // Generate real Web Crypto ECDH identity key bundle on client boot
+  useEffect(() => {
+    let active = true;
+    generateEcdhKeyBundle()
+      .then((bundle) => {
+        if (active) setLocalFingerprint(bundle.fingerprintHex);
+      })
+      .catch(() => {
+        // Fallback fingerprint already initialized
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // Load initial state & connect real WebSocket to /ws with auto-reconnect
+  useEffect(() => {
+    let cancelled = false;
+
+    async function fetchInitial() {
+      try {
+        const res = await fetch('/api/state');
+        if (!res.ok) throw new Error('Gagal memuat state server Handrawina.');
+        const data = (await res.json()) as ServerSnapshotPayload;
+        if (!cancelled) {
+          setSnapshot(data);
+          setLoadError(null);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setLoadError(err instanceof Error ? err.message : 'Server tidak dapat dijangkau.');
+        }
+      }
+    }
+
+    function connectWebSocket() {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        if (!cancelled) setWsConnected(true);
+      };
+
+      ws.onclose = () => {
+        if (!cancelled) {
+          setWsConnected(false);
+          reconnectTimerRef.current = window.setTimeout(connectWebSocket, 2000);
+        }
+      };
+
+      ws.onmessage = (evt) => {
+        try {
+          const { event, payload } = JSON.parse(String(evt.data)) as {
+            event: string;
+            payload: unknown;
+          };
+
+          if (event === 'init') {
+            setSnapshot(payload as ServerSnapshotPayload);
+          } else if (event === 'message:created') {
+            const msg = payload as ChatMessage;
+            setSnapshot((prev) => {
+              if (!prev) return prev;
+              const existing = prev.messages[msg.conversationId] ?? [];
+              return {
+                ...prev,
+                conversations: prev.conversations.map((c) =>
+                  c.id === msg.conversationId ? { ...c, lastActiveText: 'Baru saja' } : c
+                ),
+                messages: {
+                  ...prev.messages,
+                  [msg.conversationId]: upsertMessageIdempotent(existing, msg),
+                },
+              };
+            });
+          } else if (event === 'conversation:created') {
+            const { conversation, messages } = payload as {
+              conversation: Conversation;
+              messages: ChatMessage[];
+            };
+            setSnapshot((prev) => {
+              if (!prev) return prev;
+              if (prev.conversations.some((c) => c.id === conversation.id)) return prev;
+              return {
+                ...prev,
+                conversations: [conversation, ...prev.conversations],
+                messages: {
+                  ...prev.messages,
+                  [conversation.id]: messages,
+                },
+              };
+            });
+          } else if (event === 'group:epoch_rotated') {
+            const { conversation, systemMessage } = payload as {
+              conversation: Conversation;
+              systemMessage: ChatMessage;
+            };
+            setSnapshot((prev) => {
+              if (!prev) return prev;
+              return {
+                ...prev,
+                conversations: prev.conversations.map((c) =>
+                  c.id === conversation.id ? conversation : c
+                ),
+                messages: {
+                  ...prev.messages,
+                  [conversation.id]: upsertMessageIdempotent(
+                    prev.messages[conversation.id] ?? [],
+                    systemMessage
+                  ),
+                },
+              };
+            });
+          } else if (event === 'devices:updated') {
+            const nextDevices = payload as PairedDevice[];
+            setSnapshot((prev) => (prev ? { ...prev, devices: nextDevices } : prev));
+          } else if (event === 'account:updated') {
+            const { account, devices } = payload as {
+              account: ServerSnapshotPayload['account'];
+              devices: PairedDevice[];
+            };
+            setSnapshot((prev) => (prev ? { ...prev, account, devices } : prev));
+          } else if (event === 'settings:updated') {
+            const { account, settings } = payload as {
+              account: ServerSnapshotPayload['account'];
+              settings: AppSettings;
+            };
+            setSnapshot((prev) => (prev ? { ...prev, account, settings } : prev));
+          } else if (event === 'backup:updated') {
+            const nextBackup = payload as ServerSnapshotPayload['backup'];
+            setSnapshot((prev) => (prev ? { ...prev, backup: nextBackup } : prev));
+          } else if (event === 'business:updated') {
+            const nextBusiness = payload as ServerSnapshotPayload['business'];
+            setSnapshot((prev) => (prev ? { ...prev, business: nextBusiness } : prev));
+          } else if (event === 'business:webhook_logged') {
+            const log = payload as ServerSnapshotPayload['business']['webhookLogs'][number];
+            setSnapshot((prev) => {
+              if (!prev) return prev;
+              return {
+                ...prev,
+                business: {
+                  ...prev.business,
+                  webhookLogs: [log, ...prev.business.webhookLogs].slice(0, 20),
+                },
+              };
+            });
+          } else if (event === 'conversations:updated') {
+            const nextConvs = payload as Conversation[];
+            setSnapshot((prev) => (prev ? { ...prev, conversations: nextConvs } : prev));
+          } else if (event === 'call:logged') {
+            const rec = payload as CallRecord;
+            setSnapshot((prev) => {
+              if (!prev) return prev;
+              if (prev.calls.some((c) => c.id === rec.id)) return prev;
+              return { ...prev, calls: [rec, ...prev.calls].slice(0, 20) };
+            });
+          } else if (event === 'call:participant_joined') {
+            const { roomCode, participantName } = payload as {
+              roomCode: string;
+              participantName: string;
+            };
+            setActiveCall((prev) => {
+              if (!prev || prev.roomCode !== roomCode) return prev;
+              if (prev.participants.includes(participantName)) return prev;
+              return {
+                ...prev,
+                participants: [...prev.participants, participantName],
+              };
+            });
+          } else if (event === 'typing:update') {
+            const { conversationId, senderName, isTyping } = payload as {
+              conversationId: string;
+              senderName: string;
+              isTyping: boolean;
+            };
+            setTypingByConv((prev) => ({
+              ...prev,
+              [conversationId]: isTyping ? senderName : null,
+            }));
+          } else if (event === 'receipt:read') {
+            const { conversationId } = payload as { conversationId: string };
+            setSnapshot((prev) => {
+              if (!prev) return prev;
+              return {
+                ...prev,
+                conversations: prev.conversations.map((c) =>
+                  c.id === conversationId ? { ...c, unreadCount: 0 } : c
+                ),
+                messages: {
+                  ...prev.messages,
+                  [conversationId]: (prev.messages[conversationId] ?? []).map((m) => ({
+                    ...m,
+                    status: 'read',
+                  })),
+                },
+              };
+            });
+          }
+        } catch {
+          // Ignore malformed WS events
+        }
+      };
+    }
+
+    fetchInitial();
+    connectWebSocket();
+
+    return () => {
+      cancelled = true;
+      if (reconnectTimerRef.current) window.clearTimeout(reconnectTimerRef.current);
+      wsRef.current?.close();
+    };
+  }, []);
+
+  const handleSelectConversation = useCallback(
+    (id: string) => {
+      setActiveConvId(id);
+      if (
+        wsRef.current?.readyState === WebSocket.OPEN &&
+        snapshot?.settings.readReceiptsEnabled !== false
+      ) {
+        wsRef.current.send(
+          JSON.stringify({ event: 'receipt:read', payload: { conversationId: id } })
+        );
+      }
+    },
+    [snapshot?.settings.readReceiptsEnabled]
   );
-  const currentMeta = TDD_SECTIONS[currentIndex] ?? TDD_SECTIONS[0];
-  const prevSection = currentIndex > 0 ? TDD_SECTIONS[currentIndex - 1] : null;
-  const nextSection =
-    currentIndex < TDD_SECTIONS.length - 1 ? TDD_SECTIONS[currentIndex + 1] : null;
 
-  const handleSelectSection = (id: SectionId) => {
-    setActiveSection(id);
-    setMobileMenuOpen(false);
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  };
+  const handleSendMessage = useCallback(
+    async (params: {
+      conversationId: string;
+      plaintext: string;
+      kind?: ChatMessage['kind'];
+      voiceDurationSec?: number;
+      mediaLabel?: string;
+      mediaSizeKb?: number;
+      product?: ChatMessage['product'];
+    }) => {
+      if (!snapshot) return;
+      const conv = snapshot.conversations.find((c) => c.id === params.conversationId);
+      const currentMsgs = snapshot.messages[params.conversationId] ?? [];
+      const epoch = conv?.senderKeyEpoch ?? 1;
+      const protocol =
+        conv?.kind === 'group' ? 'SenderKeys-O1' : 'Signal-DoubleRatchet';
 
-  const handleDownloadMarkdown = () => {
-    const content = generateFullTddMarkdown();
-    const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = 'handrawina-technical-design-document.md';
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
-    setDownloadedNotice(true);
-    window.setTimeout(() => setDownloadedNotice(false), 2400);
-  };
+      // REAL client-side Web Crypto AES-256-GCM encryption before transmitting over WebSocket
+      const convKey = await deriveConversationKey(params.conversationId, epoch);
+      const envelope = await encryptE2eePayload({
+        key: convKey,
+        plaintext: params.plaintext,
+        aad: `${params.conversationId}:epoch-${epoch}`,
+        protocol,
+        ratchetStep: currentMsgs.length + 1,
+        senderKeyEpoch: conv?.kind === 'group' ? epoch : undefined,
+      });
 
-  const handleCopyFullMarkdown = async () => {
-    try {
-      await navigator.clipboard.writeText(generateFullTddMarkdown());
-      setCopiedMarkdown(true);
-      window.setTimeout(() => setCopiedMarkdown(false), 2000);
-    } catch {
-      setCopiedMarkdown(false);
+      const msg: ChatMessage = {
+        id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        conversationId: params.conversationId,
+        senderId: 'self',
+        senderName: snapshot.account.displayName,
+        senderDeviceId: 'dev-web-1',
+        kind: params.kind ?? 'text',
+        plaintext: params.plaintext,
+        voiceDurationSec: params.voiceDurationSec,
+        mediaLabel: params.mediaLabel,
+        mediaSizeKb: params.mediaSizeKb,
+        product: params.product,
+        envelope,
+        timestamp: new Date().toLocaleTimeString('id-ID', {
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: false,
+        }),
+        status: 'sending',
+      };
+
+      // Optimistic local append (reconciled idempotently on server broadcast)
+      setSnapshot((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          messages: {
+            ...prev.messages,
+            [params.conversationId]: upsertMessageIdempotent(
+              prev.messages[params.conversationId] ?? [],
+              msg
+            ),
+          },
+        };
+      });
+
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ event: 'message:send', payload: msg }));
+      }
+    },
+    [snapshot]
+  );
+
+  const handleTypingChange = useCallback(
+    (conversationId: string, isTyping: boolean) => {
+      if (
+        wsRef.current?.readyState === WebSocket.OPEN &&
+        snapshot &&
+        snapshot.settings.typingIndicatorsEnabled
+      ) {
+        wsRef.current.send(
+          JSON.stringify({
+            event: 'typing:update',
+            payload: { conversationId, senderName: snapshot.account.displayName, isTyping },
+          })
+        );
+      }
+    },
+    [snapshot]
+  );
+
+  const handleCreateConversation = async (params: {
+    name: string;
+    kind: ConversationKind;
+    participantCount?: number;
+  }) => {
+    const res = await fetch('/api/conversations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    });
+    if (res.ok) {
+      const data = (await res.json()) as { conversation: Conversation };
+      setActiveConvId(data.conversation.id);
     }
   };
 
-  return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col">
-      {/* Top Bar Contract: 3 zones separated by gap-8 (Brand wordmark | single-line nav links | 1 primary CTA) */}
-      <header className="sticky top-0 z-30 bg-white/95 backdrop-blur-xs border-b border-slate-200">
-        <div className="max-w-[1440px] mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-8">
-          {/* Zone 1: Single-element Brand Wordmark + mobile nav button */}
-          <div className="flex items-center gap-3 shrink-0">
-            <button
-              type="button"
-              onClick={() => setMobileMenuOpen((v) => !v)}
-              aria-label={mobileMenuOpen ? 'Tutup daftar bab' : 'Buka daftar bab'}
-              aria-expanded={mobileMenuOpen}
-              className="lg:hidden p-2 -ml-2 text-slate-700 hover:text-slate-900 hover:bg-slate-100 rounded-md cursor-pointer"
-            >
-              {mobileMenuOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
-            </button>
-            <button
-              type="button"
-              onClick={() => handleSelectSection('overview')}
-              className="text-lg font-display font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              Handrawina
-            </button>
-          </div>
+  const handleRotateGroupEpoch = async (conversationId: string) => {
+    await fetch(`/api/groups/${encodeURIComponent(conversationId)}/rotate-epoch`, {
+      method: 'POST',
+    });
+  };
 
-          {/* Zone 2: Concise single-line navigation links */}
-          <nav
-            aria-label="Navigasi utama dokumen"
-            className="hidden xl:flex items-center gap-6 text-sm font-medium text-slate-600"
+  const handleOpenJoinBarcode = useCallback((mode: JoinBarcodeMode) => {
+    setJoinModalMode(mode);
+    setJoinModalOpen(true);
+  }, []);
+
+  const handleLaunchOutgoingCall = useCallback(
+    (params: OutgoingCallLaunchParams) => {
+      const roomSuffix = Math.random().toString(16).slice(2, 8).toUpperCase();
+      const roomCode = `HND-VID-${roomSuffix}`;
+      const useTurn = params.protectIpViaTurn;
+
+      const targetConv: Conversation =
+        params.conversation ?? {
+          id: `dial-${Date.now()}`,
+          name: params.customTargetName || 'Nomor Panggilan Keluar',
+          handle: params.customTargetHandle || 'Panggilan Keluar E2EE',
+          kind: 'direct',
+          initials: (params.customTargetName || 'PK')
+            .replace(/^\+/, '')
+            .slice(0, 2)
+            .toUpperCase(),
+          unreadCount: 0,
+          lastActiveText: 'Panggilan keluar aktif',
+          online: true,
+          participantCount: 2,
+          peerPublicKeyFingerprint: 'a10f92b4c8d300112233445566778899',
+          labels: [],
+        };
+
+      const isGroup = targetConv.kind === 'group';
+      const topology: CallRecord['topology'] = useTurn
+        ? 'TURN-Relay-SRTP'
+        : isGroup
+        ? 'SFU-SFrame-E2EE'
+        : 'P2P-DTLS-SRTP';
+
+      setActiveCall({
+        roomCode,
+        conversation: targetConv,
+        mode: params.mode,
+        topology,
+        participants: isGroup
+          ? [snapshot?.account.displayName ?? 'Anda', 'Raka Pratama', 'Dimas Wijaya', 'Nadia Kusuma']
+          : [snapshot?.account.displayName ?? 'Anda', targetConv.name],
+        protectIpViaTurn: useTurn,
+        direction: 'outgoing',
+      });
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            event: 'call:room_join',
+            payload: { roomCode, participantName: snapshot?.account.displayName ?? 'Anda' },
+          })
+        );
+      }
+      setActiveTab('calls');
+    },
+    [snapshot?.account.displayName]
+  );
+
+  const handleStartCall = (conversation: Conversation, mode: 'audio' | 'video') => {
+    handleLaunchOutgoingCall({
+      conversation,
+      mode,
+      protectIpViaTurn: snapshot?.settings.alwaysRelayCallsTurn ?? false,
+    });
+  };
+
+  const handleJoinCallByCode = useCallback(
+    (roomCode: string) => {
+      const normalized = roomCode.trim().toUpperCase();
+      setActiveCall((prev) => {
+        if (prev && prev.roomCode === normalized) return prev;
+        const syntheticRoomConv: Conversation = {
+          id: `room-${normalized.toLowerCase()}`,
+          name: `Ruang Video Call · ${normalized}`,
+          handle: 'WebRTC SFU + SFrame E2EE',
+          kind: 'group',
+          initials: 'VC',
+          unreadCount: 0,
+          lastActiveText: 'Aktif sekarang',
+          online: true,
+          participantCount: 2,
+          peerPublicKeyFingerprint: '8f1a22c9e0b14490a32e1099d2f18a40',
+          labels: [],
+        };
+        return {
+          roomCode: normalized,
+          conversation: syntheticRoomConv,
+          mode: 'video',
+          topology: 'SFU-SFrame-E2EE',
+          participants: [snapshot?.account.displayName ?? 'Anda', 'Host Handrawina'],
+          protectIpViaTurn: false,
+        };
+      });
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            event: 'call:room_join',
+            payload: { roomCode: normalized, participantName: snapshot?.account.displayName ?? 'Anda' },
+          })
+        );
+      }
+      setActiveTab('calls');
+    },
+    [snapshot?.account.displayName]
+  );
+
+  // Auto-redeem deep link (?join=, ?pair=, ?call=) when opening a scanned QR/Barcode URL
+  useEffect(() => {
+    if (!snapshot) return;
+    const params = new URLSearchParams(window.location.search);
+    const rawParam = params.get('call') ?? params.get('join') ?? params.get('pair');
+    if (!rawParam) return;
+    const parsed = parseHandrawinaJoinInput(rawParam);
+    window.history.replaceState({}, '', window.location.pathname);
+    if (parsed.kind === 'invalid') return;
+
+    fetch('/api/join/redeem', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: parsed.code }),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then(
+        (
+          data: {
+            mode?: JoinBarcodeMode;
+            conversationId?: string;
+            callRoomCode?: string;
+          } | null
+        ) => {
+          if (!data) return;
+          if (data.mode === 'call' && data.callRoomCode) {
+            handleJoinCallByCode(data.callRoomCode);
+          } else if (data.mode === 'invite' && data.conversationId) {
+            setActiveConvId(data.conversationId);
+            setActiveTab('chats');
+          } else if (data.mode === 'pair') {
+            setActiveTab('security');
+          }
+        }
+      )
+      .catch(() => {
+        // Ignore deep-link errors silently
+      });
+  }, [Boolean(snapshot), handleJoinCallByCode]);
+
+  const handleEndCall = async (durationSec: number) => {
+    if (!activeCall) return;
+    const payload: Partial<CallRecord> = {
+      conversationId: activeCall.conversation.id,
+      peerName: activeCall.conversation.name,
+      mode: activeCall.mode,
+      topology: activeCall.protectIpViaTurn ? 'TURN-Relay-SRTP' : activeCall.topology,
+      participants: activeCall.participants,
+      durationSec,
+      direction: 'outgoing',
+    };
+    setActiveCall(null);
+    await fetch('/api/calls/log', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  };
+
+  const backupSnapshotJson = useMemo(() => {
+    if (!snapshot) return '{}';
+    const totalMessages = Object.values(snapshot.messages).reduce(
+      (sum, arr) => sum + arr.length,
+      0
+    );
+    return JSON.stringify({
+      app: 'Handrawina',
+      accountId: snapshot.account.accountId,
+      totalConversations: snapshot.conversations.length,
+      totalMessages,
+      exportedAt: new Date().toISOString(),
+    });
+  }, [snapshot]);
+
+  const handleShareProductToChat = async (product: BusinessProduct) => {
+    setActiveTab('chats');
+    const bizConv =
+      snapshot?.conversations.find((c) => c.kind === 'business') ?? snapshot?.conversations[0];
+    if (!bizConv) return;
+    setActiveConvId(bizConv.id);
+    await handleSendMessage({
+      conversationId: bizConv.id,
+      plaintext: `Katalog Produk: ${product.title}`,
+      kind: 'product',
+      product: {
+        productId: product.id,
+        sku: product.sku,
+        title: product.title,
+        priceIdr: product.priceIdr,
+        description: product.description,
+      },
+    });
+  };
+
+  if (loadError) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
+        <div className="max-w-md w-full bg-white border border-slate-200 rounded-lg p-6 text-center space-y-3">
+          <h1 className="text-lg font-display font-bold text-slate-900">
+            Gagal Terhubung ke Server Handrawina
+          </h1>
+          <p className="text-sm text-slate-600">{loadError}</p>
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md cursor-pointer"
           >
-            {TOP_NAV_ITEMS.slice(0, 5).map((item) => {
-              const isActive = item.id === activeSection;
+            Muat Ulang Aplikasi
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!snapshot) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
+        <div className="text-sm font-medium text-slate-600">
+          Menyiapkan sesi kriptografi Handrawina...
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="h-screen flex flex-col bg-slate-50 text-slate-900 overflow-hidden">
+      {/* Top Bar Contract: Single-row, 3 zones separated by gap-8 */}
+      <header className="h-14 sm:h-16 bg-white border-b border-slate-200 shrink-0 z-30">
+        <div className="max-w-[1440px] mx-auto h-full px-4 sm:px-6 flex items-center justify-between gap-8">
+          {/* Zone 1: Single-element Brand Wordmark */}
+          <button
+            type="button"
+            onClick={() => setActiveTab('chats')}
+            className="text-lg font-display font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            Handrawina
+          </button>
+
+          {/* Zone 2: 5 concise single-line navigation links (Desktop) */}
+          <nav
+            aria-label="Navigasi aplikasi Handrawina"
+            className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-600"
+          >
+            {WORKSPACE_TABS.map((tab) => {
+              const isActive = activeTab === tab.id;
               return (
                 <button
-                  key={item.id}
+                  key={tab.id}
                   type="button"
-                  onClick={() => handleSelectSection(item.id)}
+                  onClick={() => setActiveTab(tab.id)}
                   className={`py-1 border-b-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                     isActive
                       ? 'text-teal-800 border-teal-700'
                       : 'text-slate-600 border-transparent hover:text-slate-900 hover:border-slate-300'
                   }`}
                 >
-                  {item.label}
+                  {tab.label}
                 </button>
               );
             })}
           </nav>
 
-          {/* Zone 3: Single Primary Action */}
-          <div className="flex items-center shrink-0">
+          {/* Zone 3: Settings Utility + Primary Outgoing Call Action */}
+          <div className="flex items-center gap-2 shrink-0">
             <button
               type="button"
-              onClick={handleDownloadMarkdown}
-              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              onClick={() => setActiveTab('settings')}
+              aria-label="Pengaturan Handrawina"
+              className={`inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-2 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                activeTab === 'settings'
+                  ? 'bg-teal-50 text-teal-800 border-teal-300'
+                  : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50 hover:text-slate-900'
+              }`}
             >
-              {downloadedNotice ? (
-                <>
-                  <Check className="w-3.5 h-3.5" aria-hidden="true" />
-                  TDD Diunduh
-                </>
-              ) : (
-                <>
-                  <Download className="w-3.5 h-3.5" aria-hidden="true" />
-                  Unduh Markdown
-                </>
-              )}
+              <Settings className="w-3.5 h-3.5" aria-hidden="true" />
+              <span className="hidden sm:inline">Pengaturan</span>
             </button>
+
+            {activeCall ? (
+              <button
+                type="button"
+                onClick={() => setActiveTab('calls')}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <PhoneOutgoing className="w-3.5 h-3.5" aria-hidden="true" />
+                Kembali ke Panggilan
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setOutgoingCallModalOpen(true)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <PhoneOutgoing className="w-3.5 h-3.5" aria-hidden="true" />
+                Panggilan Keluar
+              </button>
+            )}
           </div>
         </div>
       </header>
 
-      {/* Mobile Navigation Drawer */}
-      {mobileMenuOpen && (
-        <div className="lg:hidden fixed inset-x-0 top-16 bottom-0 z-20 bg-white border-b border-slate-200 overflow-y-auto p-4">
-          <div className="text-xs font-semibold text-slate-500 px-3 pb-2">
-            Daftar Bab Rancangan Teknis
-          </div>
-          <nav aria-label="Navigasi bab seluler" className="space-y-1">
-            {TDD_SECTIONS.map((sec) => {
-              const isActive = sec.id === activeSection;
-              return (
-                <button
-                  key={sec.id}
-                  type="button"
-                  onClick={() => handleSelectSection(sec.id)}
-                  className={`w-full text-left px-3 py-2.5 rounded-md text-sm flex items-baseline gap-3 transition-colors cursor-pointer ${
-                    isActive
-                      ? 'bg-teal-50 text-teal-900 font-semibold'
-                      : 'text-slate-700 hover:bg-slate-100'
-                  }`}
-                >
-                  <span className="font-mono text-xs text-slate-500 tabular-nums">
-                    {sec.number}
-                  </span>
-                  <span>{sec.shortTitle}</span>
-                </button>
-              );
-            })}
-          </nav>
-        </div>
-      )}
+      {/* Main Workspace Area */}
+      <main className="flex-1 min-h-0 flex flex-col max-w-[1440px] w-full mx-auto overflow-hidden pb-14 md:pb-0">
+        {activeTab === 'chats' && (
+          <ChatWorkspace
+            account={snapshot.account}
+            localFingerprint={localFingerprint}
+            conversations={snapshot.conversations}
+            messagesByConv={snapshot.messages}
+            activeConvId={activeConvId}
+            onSelectConversation={handleSelectConversation}
+            onSendMessage={handleSendMessage}
+            onCreateConversation={handleCreateConversation}
+            onRotateGroupEpoch={handleRotateGroupEpoch}
+            onTypingChange={handleTypingChange}
+            typingByConv={typingByConv}
+            onStartCall={handleStartCall}
+            onOpenJoinBarcode={handleOpenJoinBarcode}
+            businessProducts={snapshot.business.products}
+            wsConnected={wsConnected}
+          />
+        )}
 
-      {/* Main Workspace: 260px Sidebar + Main Content Viewport */}
-      <div className="max-w-[1440px] w-full mx-auto flex-1 flex">
-        <aside
-          aria-label="Daftar isi dokumen teknis"
-          className="hidden lg:flex flex-col w-[268px] shrink-0 border-r border-slate-200 bg-white px-4 py-6"
-        >
-          <div className="sticky top-24 space-y-6">
-            <div>
-              <div className="px-3 text-xs font-semibold text-slate-500 mb-2">
-                Dokumen Rancangan Teknis
-              </div>
-              <nav className="space-y-1">
-                {TDD_SECTIONS.map((sec) => {
-                  const isActive = sec.id === activeSection;
-                  return (
-                    <button
-                      key={sec.id}
-                      type="button"
-                      onClick={() => handleSelectSection(sec.id)}
-                      className={`w-full text-left px-3 py-2 rounded-md text-sm flex items-baseline gap-2.5 transition-colors cursor-pointer ${
-                        isActive
-                          ? 'bg-teal-50 text-teal-900 font-semibold'
-                          : 'text-slate-700 hover:bg-slate-100 hover:text-slate-900'
-                      }`}
-                    >
-                      <span
-                        className={`font-mono text-xs tabular-nums shrink-0 ${
-                          isActive ? 'text-teal-700' : 'text-slate-400'
-                        }`}
-                      >
-                        {sec.number}.
-                      </span>
-                      <span className="truncate">{sec.shortTitle}</span>
-                    </button>
-                  );
-                })}
-              </nav>
-            </div>
+        {activeTab === 'calls' && (
+          <CallsWorkspace
+            conversations={snapshot.conversations}
+            callRecords={snapshot.calls}
+            iceConfig={snapshot.iceConfig}
+            defaultVideoQuality={snapshot.settings.defaultVideoQuality}
+            activeCall={activeCall}
+            onStartCall={handleStartCall}
+            onJoinCallByCode={handleJoinCallByCode}
+            onEndCall={handleEndCall}
+            onOpenJoinBarcode={handleOpenJoinBarcode}
+            onOpenOutgoingCallModal={() => setOutgoingCallModalOpen(true)}
+            onToggleTurnProtect={() =>
+              setActiveCall((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      protectIpViaTurn: !prev.protectIpViaTurn,
+                      topology: !prev.protectIpViaTurn
+                        ? 'TURN-Relay-SRTP'
+                        : prev.conversation.kind === 'group'
+                        ? 'SFU-SFrame-E2EE'
+                        : 'P2P-DTLS-SRTP',
+                    }
+                  : prev
+              )
+            }
+          />
+        )}
 
-            <div className="pt-5 border-t border-slate-200 px-3 space-y-3">
-              <div className="text-xs font-semibold text-slate-500">Metadata Spesifikasi</div>
-              <dl className="space-y-2 text-xs text-slate-600">
-                <div>
-                  <dt className="text-slate-400">Peran Penyusun</dt>
-                  <dd className="text-slate-800 font-medium">
-                    Principal System Architect &amp; Security Engineer
-                  </dd>
-                </div>
-                <div>
-                  <dt className="text-slate-400">Standar Kriptografi</dt>
-                  <dd className="font-mono text-slate-800">Signal X3DH · Double Ratchet · SFrame · OPAQUE</dd>
-                </div>
-                <div>
-                  <dt className="text-slate-400">Artefak Termasuk</dt>
-                  <dd className="text-slate-800">6 Diagram Mermaid · 4 Engine DDL · 3 Simulator</dd>
-                </div>
-              </dl>
+        {activeTab === 'security' && (
+          <SecurityDevicesWorkspace
+            account={snapshot.account}
+            devices={snapshot.devices}
+            backup={snapshot.backup}
+            backupSnapshotJson={backupSnapshotJson}
+            onOpenJoinBarcode={handleOpenJoinBarcode}
+            onPairDevice={async (name, platform) => {
+              const res = await fetch('/api/devices/pair', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, platform }),
+              });
+              if (!res.ok) {
+                const err = (await res.json()) as { error?: string };
+                throw new Error(err.error ?? 'Gagal menautkan perangkat.');
+              }
+            }}
+            onRevokeDevice={async (deviceId) => {
+              await fetch(`/api/devices/${encodeURIComponent(deviceId)}`, {
+                method: 'DELETE',
+              });
+            }}
+            onTogglePrimaryOnline={async (online) => {
+              await fetch('/api/devices/primary-status', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ online }),
+              });
+            }}
+            onMigratePhone={async (params) => {
+              const res = await fetch('/api/account/migrate-phone', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(params),
+              });
+              const data = (await res.json()) as {
+                error?: string;
+                preservedGroups?: number;
+                preservedThreads?: number;
+              };
+              if (!res.ok) {
+                return { ok: false, message: data.error ?? 'Migrasi gagal.' };
+              }
+              return {
+                ok: true,
+                message: `Migrasi berhasil! Account UUID tetap utuh, ${data.preservedGroups ?? 0} grup dan ${data.preservedThreads ?? 0} riwayat obrolan terjaga tanpa kehilangan data.`,
+              };
+            }}
+            onUploadBackup={async (params) => {
+              await fetch('/api/backup/vault', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(params),
+              });
+            }}
+            onRestoreBackup={async (verifierHash) => {
+              const res = await fetch('/api/backup/restore', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ verifierHash }),
+              });
+              const data = (await res.json()) as {
+                encryptedBlob?: { saltBase64: string; ivBase64: string; ciphertextBase64: string };
+                error?: string;
+              };
+              if (!res.ok) {
+                return { ok: false, error: data.error ?? 'Gagal memulihkan cadangan.' };
+              }
+              return { ok: true, encryptedBlob: data.encryptedBlob };
+            }}
+          />
+        )}
 
-              <button
-                type="button"
-                onClick={handleCopyFullMarkdown}
-                className="w-full inline-flex items-center justify-center gap-2 px-3 py-2 text-xs font-medium text-slate-700 bg-slate-50 border border-slate-200 rounded-md hover:bg-slate-100 hover:text-slate-900 transition-colors cursor-pointer"
-              >
-                {copiedMarkdown ? (
-                  <>
-                    <Check className="w-3.5 h-3.5 text-teal-700" aria-hidden="true" />
-                    Markdown Tersalin
-                  </>
-                ) : (
-                  <>
-                    <Copy className="w-3.5 h-3.5" aria-hidden="true" />
-                    Salin Seluruh Dokumen
-                  </>
-                )}
-              </button>
-            </div>
-          </div>
-        </aside>
+        {activeTab === 'business' && (
+          <BusinessWorkspace
+            products={snapshot.business.products}
+            autoReplies={snapshot.business.autoReplies}
+            labels={snapshot.business.labels}
+            webhooks={snapshot.business.webhooks}
+            webhookLogs={snapshot.business.webhookLogs}
+            conversations={snapshot.conversations}
+            onCreateProduct={async (params) => {
+              await fetch('/api/business/catalog', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(params),
+              });
+            }}
+            onToggleProduct={async (id) => {
+              await fetch(`/api/business/catalog/${encodeURIComponent(id)}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+              });
+            }}
+            onCreateAutoReply={async (triggerKeyword, responseText) => {
+              await fetch('/api/business/autoreply', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ triggerKeyword, responseText }),
+              });
+            }}
+            onToggleAutoReply={async (id) => {
+              await fetch(`/api/business/autoreply/${encodeURIComponent(id)}`, {
+                method: 'PATCH',
+              });
+            }}
+            onToggleLabel={async (conversationId, label) => {
+              await fetch(`/api/business/labels/${encodeURIComponent(conversationId)}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ label }),
+              });
+            }}
+            onCreateWebhook={async (targetUrl) => {
+              await fetch('/api/business/webhooks', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ targetUrl }),
+              });
+            }}
+            onTriggerWebhookTest={async (webhookId, eventName) => {
+              await fetch('/api/business/webhooks/test', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ webhookId, eventName }),
+              });
+            }}
+            onShareProductToChat={handleShareProductToChat}
+          />
+        )}
 
-        {/* Main Document Canvas */}
-        <main className="flex-1 min-w-0 px-5 sm:px-8 lg:px-12 py-8 lg:py-10">
-          <article className="max-w-[1040px] mx-auto">
-            {/* Document chapter header with clean unboxed metadata */}
-            <header className="pb-6 mb-8 border-b border-slate-200">
-              <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 font-mono tabular-nums mb-2">
-                <span>Bab {currentMeta.number} dari 0{TDD_SECTIONS.length}</span>
-                <span aria-hidden="true">·</span>
-                <span>Technical Design Document</span>
-                <span aria-hidden="true">·</span>
-                <span>E2EE Messaging &amp; Calling Architecture</span>
-              </div>
-              <h1 className="text-2xl sm:text-3xl font-display font-bold tracking-tight text-slate-900">
-                {currentMeta.number}. {currentMeta.title}
-              </h1>
-              <p className="text-sm sm:text-base text-slate-600 mt-2.5 max-w-3xl leading-relaxed">
-                {currentMeta.subtitle}
-              </p>
-            </header>
+        {activeTab === 'tdd' && <TddEmbeddedWorkspace />}
 
-            <ActiveTddSection sectionId={activeSection} />
+        {activeTab === 'settings' && (
+          <SettingsWorkspace
+            account={snapshot.account}
+            settings={snapshot.settings}
+            onOpenSecurityTab={() => setActiveTab('security')}
+            onSaveSettings={async (params) => {
+              const res = await fetch('/api/settings', {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(params),
+              });
+              const data = (await res.json()) as {
+                account?: ServerSnapshotPayload['account'];
+                settings?: AppSettings;
+                error?: string;
+              };
+              if (!res.ok) {
+                return { ok: false, message: data.error ?? 'Gagal menyimpan pengaturan.' };
+              }
+              if (data.account && data.settings) {
+                setSnapshot((prev) =>
+                  prev ? { ...prev, account: data.account!, settings: data.settings! } : prev
+                );
+              }
+              return {
+                ok: true,
+                message: 'Pengaturan Handrawina berhasil disimpan dan disinkronkan ke seluruh perangkat.',
+              };
+            }}
+            onResetSettings={async () => {
+              const res = await fetch('/api/settings/reset', { method: 'POST' });
+              if (res.ok) {
+                const data = (await res.json()) as {
+                  account: ServerSnapshotPayload['account'];
+                  settings: AppSettings;
+                };
+                setSnapshot((prev) =>
+                  prev ? { ...prev, account: data.account, settings: data.settings } : prev
+                );
+              }
+            }}
+          />
+        )}
+      </main>
 
-            {/* Chapter footer pagination */}
-            <nav
-              aria-label="Navigasi antar bab"
-              className="mt-12 pt-6 border-t border-slate-200 flex flex-wrap items-center justify-between gap-4"
+      {/* Mobile Touch-First Bottom Navigation Bar (< md, strictly compact 56px height) */}
+      <nav
+        aria-label="Navigasi bawah seluler Handrawina"
+        className="md:hidden fixed bottom-0 inset-x-0 z-30 h-14 bg-white/95 backdrop-blur-xs border-t border-slate-200 grid grid-cols-5"
+      >
+        {WORKSPACE_TABS.map((tab) => {
+          const Icon = tab.icon;
+          const isActive = activeTab === tab.id;
+          return (
+            <button
+              key={tab.id}
+              type="button"
+              onClick={() => setActiveTab(tab.id)}
+              className={`flex flex-col items-center justify-center gap-0.5 min-h-[44px] transition-colors cursor-pointer ${
+                isActive ? 'text-teal-800 font-semibold' : 'text-slate-500'
+              }`}
             >
-              {prevSection ? (
-                <button
-                  type="button"
-                  onClick={() => handleSelectSection(prevSection.id)}
-                  className="inline-flex items-center gap-2.5 px-4 py-2.5 text-left bg-white border border-slate-200 rounded-md hover:border-teal-700 hover:bg-slate-50 transition-colors cursor-pointer"
-                >
-                  <ArrowLeft className="w-4 h-4 text-slate-500 shrink-0" aria-hidden="true" />
-                  <div>
-                    <div className="text-[11px] text-slate-500">Bab Sebelumnya</div>
-                    <div className="text-sm font-medium text-slate-900">
-                      {prevSection.number}. {prevSection.shortTitle}
-                    </div>
-                  </div>
-                </button>
-              ) : (
-                <div />
-              )}
+              <Icon className="w-4 h-4" aria-hidden="true" />
+              <span className="text-[10px] leading-none truncate max-w-full px-1">
+                {tab.mobileLabel}
+              </span>
+            </button>
+          );
+        })}
+      </nav>
 
-              {nextSection ? (
-                <button
-                  type="button"
-                  onClick={() => handleSelectSection(nextSection.id)}
-                  className="inline-flex items-center gap-2.5 px-4 py-2.5 text-right bg-white border border-slate-200 rounded-md hover:border-teal-700 hover:bg-slate-50 transition-colors cursor-pointer"
-                >
-                  <div>
-                    <div className="text-[11px] text-slate-500">Bab Berikutnya</div>
-                    <div className="text-sm font-medium text-slate-900">
-                      {nextSection.number}. {nextSection.shortTitle}
-                    </div>
-                  </div>
-                  <ArrowRight className="w-4 h-4 text-teal-700 shrink-0" aria-hidden="true" />
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={handleDownloadMarkdown}
-                  className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 rounded-md transition-colors cursor-pointer"
-                >
-                  <Download className="w-4 h-4" aria-hidden="true" />
-                  Unduh Dokumen Lengkap (.md)
-                </button>
-              )}
-            </nav>
-          </article>
-        </main>
-      </div>
+      {/* Outgoing Call Dialer & Contact Picker Modal */}
+      <OutgoingCallModal
+        open={outgoingCallModalOpen}
+        conversations={snapshot.conversations}
+        defaultTurnProtect={snapshot.settings.alwaysRelayCallsTurn}
+        onClose={() => setOutgoingCallModalOpen(false)}
+        onLaunchOutgoingCall={handleLaunchOutgoingCall}
+      />
+
+      {/* Barcode & QR Code Join / Pairing / Video Call Modal */}
+      <JoinBarcodeModal
+        open={joinModalOpen}
+        initialMode={joinModalMode}
+        activeCallRoomCode={activeCall?.roomCode ?? null}
+        onClose={() => setJoinModalOpen(false)}
+        onRedeemSuccess={(res) => {
+          if (res.mode === 'invite' && res.conversationId) {
+            setActiveConvId(res.conversationId);
+            setActiveTab('chats');
+          } else if (res.mode === 'pair') {
+            setActiveTab('security');
+          } else if (res.mode === 'call' && res.callRoomCode) {
+            handleJoinCallByCode(res.callRoomCode);
+            setJoinModalOpen(false);
+          }
+        }}
+      />
     </div>
   );
 }

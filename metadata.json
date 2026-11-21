@@ -1,6 +1,6 @@
 {
   "name": "AegisMsg — Dokumen Rancangan Teknis Sistem Perpesanan E2EE",
   "description": "Dokumen rancangan teknis (Technical Design Document) arsitektur sistem perpesanan instan dan panggilan suara/video terenkripsi ujung-ke-ujung berskala tinggi.",
-  "requestFramePermissions": [],
+  "requestFramePermissions": ["camera", "microphone"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
